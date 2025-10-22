@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <Windows.h>
+
+#include <memory>
 #include <iostream>
 #include <pqxx/pqxx>
 #include <string>
-#include <iostream>
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -21,7 +23,7 @@
 #include <condition_variable>
 
 
-template<bool countRequestsAndEdicts = false>
+template<bool countRequestsAndEdicts = false, bool enableThreadsHealthCare=true>
 class ConnectionPool
 {
 private:
@@ -62,9 +64,14 @@ private:
 	std::condition_variable informer_cv;
 	std::mutex m_q;
 
+	std::condition_variable doctor_cv;
+
 	std::mutex commitMutex;
 
 	std::vector<std::thread> pool;
+	std::vector<std::thread> doctors;
+
+	std::vector<std::atomic_flag> health_flags;
 
 	std::queue<std::pair<size_t, std::string>> tasks;
 	std::unordered_map<size_t, Task> results;
@@ -74,9 +81,22 @@ private:
 public:
 
 	ConnectionPool(std::string auth, size_t numWorkers = 4) : authString(auth), poolSize(numWorkers){
+		
+		
+		if constexpr (enableThreadsHealthCare) {
+			
+			std::vector<std::atomic_flag> buf(numWorkers);
+			health_flags = std::move(buf);
+			doctors.reserve(1);
+			doctors.emplace_back(&ConnectionPool::health_care, this);
+		}
+
+		std::atomic_thread_fence(std::memory_order_seq_cst);
 		pool.reserve(numWorkers);
 		for (size_t i = 0; i < numWorkers; i++) {
-			pool.emplace_back(&ConnectionPool::process, this);
+			
+			pool.emplace_back(&ConnectionPool::process, this, i);
+			
 		}
 
 	}
@@ -192,23 +212,32 @@ public:
 		if constexpr (countRequestsAndEdicts) std::cout << "REQUESTS: " << requests_processed << std::endl;
 		if constexpr (countRequestsAndEdicts) std::cout << "EDICTS: " << edicts_processed << std::endl;
 		quite = true;
+		doctor_cv.notify_all();
 		queue_cv.notify_all();
 		informer_cv.notify_all();
-		for (int i = 0; i < pool.size(); i++) {
-			pool[i].join();
+		for (auto& el : pool) {
+			if(el.joinable()) el.join();
+		}
+		if constexpr (enableThreadsHealthCare) {
+			for (auto& el : doctors) {
+				if (el.joinable()) el.join();
+			}
 		}
 	}
 
 private:
 
-	void process() {
+	void process(size_t threadId) {
 		pqxx::connection connectionObject(authString);
 
 
 		while (!quite) {
 
 			std::unique_lock<std::mutex> locker(queue_mtx);
-			queue_cv.wait(locker, [this]()->bool {return !tasks.empty() or quite; });
+			queue_cv.wait(locker, [this, threadId]()->bool {
+				if constexpr (enableThreadsHealthCare) health_flags[threadId].clear(std::memory_order_relaxed);
+				return !tasks.empty() or quite; 
+				});
 
 			if (!tasks.empty() and !quite) {
 				pqxx::work worker(connectionObject);
@@ -238,7 +267,40 @@ private:
 
 	}
 
+	void health_care() {
+		std::mutex lock;
 
+		while (!quite) {
+			std::unique_lock<std::mutex> lock_ptr(lock);
+			doctor_cv.wait_for(lock_ptr, std::chrono::seconds(60), [this]()->bool {return quite.load(); });
+			if (quite)return;
+
+			for (auto& el : health_flags) {
+				el.test_and_set();
+			}
+			queue_cv.notify_all();//Будим всех чтобы они мне проставили false
+
+			doctor_cv.wait_for(lock_ptr, std::chrono::seconds(40), [this]()->bool {return quite.load(); });
+			if (quite)return;
+		
+			for (size_t i = 0; i < health_flags.size(); ++i) {
+				if (health_flags[i].test_and_set()) {
+					if (pool[i].joinable()) {
+						HANDLE thread_handle = pool[i].native_handle();
+						TerminateThread(thread_handle, 0);
+						pool[i].detach();  
+						pool[i] = std::thread(&ConnectionPool::process, this, i);
+					}
+					else {
+						pool[i] = std::thread(&ConnectionPool::process, this, i);
+					}
+					health_flags[i].clear(std::memory_order_relaxed);
+				}
+			}
+
+		}
+
+	}
 
 };
 

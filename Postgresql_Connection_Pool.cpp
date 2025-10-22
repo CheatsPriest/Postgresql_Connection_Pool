@@ -8,6 +8,8 @@ using namespace std;
 int main()
 {
 	
+
+
 	ConnectionPool<true> pool("host=localhost port=5432 dbname=#### user=postgres password=####");
 	size_t id1 = pool.request_async("select * from servers limit 10");
 	size_t id2 = pool.request_async("select * from servers limit {}", 3);
