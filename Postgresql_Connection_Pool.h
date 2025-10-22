@@ -78,9 +78,12 @@ private:
 
 	const size_t poolSize;
 
+	std::chrono::seconds doctorTimeSleep, doctorWaitsForFlags;
+
 public:
 
-	ConnectionPool(std::string auth, size_t numWorkers = 4) : authString(auth), poolSize(numWorkers){
+	ConnectionPool(std::string auth, size_t numWorkers = 4) : authString(auth), poolSize(numWorkers),
+		doctorTimeSleep(60), doctorWaitsForFlags(60){
 		
 		
 		if constexpr (enableThreadsHealthCare) {
@@ -272,7 +275,7 @@ private:
 
 		while (!quite) {
 			std::unique_lock<std::mutex> lock_ptr(lock);
-			doctor_cv.wait_for(lock_ptr, std::chrono::seconds(60), [this]()->bool {return quite.load(); });
+			doctor_cv.wait_for(lock_ptr, doctorTimeSleep, [this]()->bool {return quite.load(); });
 			if (quite)return;
 
 			for (auto& el : health_flags) {
@@ -280,7 +283,7 @@ private:
 			}
 			queue_cv.notify_all();//Будим всех чтобы они мне проставили false
 
-			doctor_cv.wait_for(lock_ptr, std::chrono::seconds(40), [this]()->bool {return quite.load(); });
+			doctor_cv.wait_for(lock_ptr, doctorWaitsForFlags, [this]()->bool {return quite.load(); });
 			if (quite)return;
 		
 			for (size_t i = 0; i < health_flags.size(); ++i) {
